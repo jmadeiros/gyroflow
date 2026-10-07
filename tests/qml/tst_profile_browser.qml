@@ -36,8 +36,15 @@ Item {
         signal all_profiles_loaded();
         property string loaded: "";
         property bool largeCatalogue: false;
+        property bool normalizedModes: false;
         function camera_selector_options(text) {
             let s = JSON.parse(text);
+            if (normalizedModes && s.camera_brand === "GoPro") {
+                return JSON.stringify({selection:s, brands:["GoPro"], models:["HERO7 Black"], model_aliases:{},
+                    lenses:[{name:"Super", zoom:false, adapted:false, has_profiles:true},
+                            {name:"Superview", zoom:false, adapted:false, has_profiles:true}],
+                    camera:{mounts:[], crop_factor:5.62}});
+            }
             if (s.camera_model === "a6000") s.camera_model = "ILCE-6000";
             return JSON.stringify({selection:s, brands:largeCatalogue ? Array.from({length:250}, (_,i) => "Brand " + i) : ["Sony", "Other maker"], models:s.camera_brand === "Sony" ? ["ILCE-6000", "ILCE-6300"] : [],
                 model_aliases:{"ILCE-6000":["Alpha 6000","a6000"]},
@@ -46,6 +53,13 @@ Item {
         }
         function browse_lens_profiles(text, compatible) {
             const s = JSON.parse(text);
+            if (normalizedModes && s.camera_brand === "GoPro") {
+                const ids = s.lens_model === "Superview"
+                    ? ["compatible-super", "native-digital-super", "standalone-superview"]
+                    : ["compatible-super", "native-digital-super", "plain-super"];
+                return JSON.stringify(ids.map(id => ({id:id, checksum:id, name:id,
+                    width:1920,height:1080,fps:30,suggested:false,official:true,rating:0})));
+            }
             if (s.camera_brand !== "Sony") return "[]";
             return JSON.stringify([1,2,3].map(i => ({id:"profile"+i, checksum:"crc"+i, name:"Calibration "+i,
                 width:1920,height:1080,fps:30,suggested:i===3,official:false,rating:0})).filter(p => compatible || !p.suggested));
@@ -69,7 +83,7 @@ Item {
     TestCase {
         name: "CameraAndProfileSelection";
         when: windowShown;
-        function init() { controllerObject.largeCatalogue = false; settingsObject.values = {}; controllerObject.loaded = ""; menu.profileChecksum = ""; }
+        function init() { controllerObject.largeCatalogue = false; controllerObject.normalizedModes = false; settingsObject.values = {}; controllerObject.loaded = ""; menu.profileChecksum = ""; }
 
         function test_large_catalogue_has_a_scrollable_viewport() {
             controllerObject.largeCatalogue = true;
@@ -161,6 +175,29 @@ Item {
             restored.setHidden(false);
             compare(restored.hiddenCount, 0);
             verify(!JSON.parse(settingsObject.values.lensProfileHidden).crc2);
+        }
+
+        function test_normalized_digital_mode_prefill_keeps_exact_profile_visible() {
+            controllerObject.normalizedModes = true;
+            const browser = createTemporaryObject(browserComponent, scene);
+            verify(browser);
+            browser.selector.setSelection("GoPro", "HERO7 Black", "Super");
+            compare(browser.profiles.length, 3);
+            verify(browser.profiles.some(p => p.id === "plain-super"));
+            verify(!browser.profiles.some(p => p.id === "standalone-superview"));
+
+            const compatibleIndex = browser.profiles.findIndex(p => p.id === "compatible-super");
+            verify(compatibleIndex >= 0);
+            browser.preview(compatibleIndex);
+            compare(controllerObject.loaded, "compatible-super");
+
+            // Match LensProfile.qml's selector prefill after the loaded digital
+            // mode resolves its display metadata from Super to Superview.
+            browser.selector.setSelection("GoPro", "HERO7 Black", "Superview");
+            compare(browser.profiles.length, 3);
+            compare(browser.currentProfile.id, "compatible-super");
+            verify(browser.profiles.some(p => p.id === "standalone-superview"));
+            verify(!browser.profiles.some(p => p.id === "plain-super"));
         }
     }
 }

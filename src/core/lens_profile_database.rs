@@ -22,6 +22,7 @@ pub struct LensProfileDatabase {
     map: HashMap<String, LensProfile>,
     loaded_callbacks: Vec<Box<dyn FnOnce(&Self) + Send + Sync + 'static>>,
     list_for_ui: Vec<(String, String, String, bool, f64, i32, String)>,
+    list_for_browse: Vec<(String, String, String, bool, f64, i32, String)>,
     pub camera_database: crate::camera_database::CameraDatabase,
     profile_setups: HashMap<String, (String, String)>,
     pub loaded: bool,
@@ -231,6 +232,14 @@ impl LensProfileDatabase {
         self.camera_database = camera_database;
         self.camera_database.add_profiles(self.map.values());
 
+        // Preserve catalogue identities before digital-lens normalization changes
+        // display metadata (for example, GoPro "Super" becomes "Superview").
+        self.profile_setups = self.map.iter().map(|(id, profile)| {
+            let camera = self.camera_database.camera(&profile.camera_brand, &profile.camera_model);
+            let lens = self.camera_database.lens(camera, &profile.lens_model);
+            (id.clone(), (camera.map(|c| c.id.clone()).unwrap_or_default(), lens.map(|l| l.id.clone()).unwrap_or_default()))
+        }).collect();
+
         let copy = self.clone();
         for (_, v) in self.map.iter_mut() {
             v.resolve_interpolations(&copy);
@@ -267,11 +276,6 @@ impl LensProfileDatabase {
     }
 
     pub fn prepare_list_for_ui(&mut self) {
-        self.profile_setups = self.map.iter().map(|(id, profile)| {
-            let camera = self.camera_database.camera(&profile.camera_brand, &profile.camera_model);
-            let lens = self.camera_database.lens(camera, &profile.lens_model);
-            (id.clone(), (camera.map(|c| c.id.clone()).unwrap_or_default(), lens.map(|l| l.id.clone()).unwrap_or_default()))
-        }).collect();
         // (name, path_to_file, crc32, official, rating, aspect_ratio*1000, author)
         let mut set = HashSet::with_capacity(self.map.len());
         let mut checksum_map = HashMap::with_capacity(self.map.len());
@@ -315,6 +319,25 @@ impl LensProfileDatabase {
             }
         }
         self.list_for_ui.sort_by(|a, b| a.0.to_ascii_lowercase().cmp(&b.0.to_ascii_lowercase()));
+        self.list_for_browse = self.list_for_ui.clone();
+        let mut set = self.list_for_browse.iter().map(|x| x.0.clone()).collect::<HashSet<_>>();
+        for (k, v) in self.map.iter().filter(|(_, v)| v.is_copy && !v.camera_brand.is_empty() && !v.camera_model.is_empty()) {
+            let mut name = v.get_display_name();
+            if set.contains(&name) { name = format!("{} by {}", name, v.calibrated_by); }
+            let mut new_name = name.clone();
+            let mut i = 2;
+            while set.contains(&new_name) {
+                new_name = format!("{} - {}", name, i);
+                i += 1;
+            }
+            set.insert(new_name.clone());
+
+            let hstretch = if v.input_horizontal_stretch > 0.01 { v.input_horizontal_stretch } else { 1.0 };
+            let vstretch = if v.input_vertical_stretch   > 0.01 { v.input_vertical_stretch   } else { 1.0 };
+            let aspect_ratio = (((v.calib_dimension.w as f64 / hstretch) / (v.calib_dimension.h.max(1) as f64 / vstretch)) * 1000.0).round() as i32;
+            self.list_for_browse.push((new_name, k.clone(), v.checksum.clone().unwrap_or_default(), v.official, v.rating.clone().unwrap_or_default(), aspect_ratio, v.calibrated_by.clone()));
+        }
+        self.list_for_browse.sort_by(|a, b| a.0.to_ascii_lowercase().cmp(&b.0.to_ascii_lowercase()));
     }
 
     pub fn search(&self, text: &str, favorites: &HashSet<String>, aspect_ratio: i32, aspect_ratio_swapped: i32) -> Vec<(String, String, String, bool, f64, i32, String)> {
@@ -392,7 +415,7 @@ impl LensProfileDatabase {
         let camera = self.camera_database.camera(&selection.camera_brand, &selection.camera_model);
         let lens = self.camera_database.lens(camera, &selection.lens_model);
         let mut rows = Vec::new();
-        for (name, id, crc, official, rating, aspect_ratio, author) in &self.list_for_ui {
+        for (name, id, crc, official, rating, aspect_ratio, author) in &self.list_for_browse {
             let Some(profile) = self.map.get(id) else { continue; };
             if profile.path_to_file.ends_with(".gyroflow") { continue; }
             let Some((camera_id, lens_id)) = self.profile_setups.get(id) else { continue; };
@@ -405,7 +428,14 @@ impl LensProfileDatabase {
                 .is_some_and(|(a,b)| self.camera_database.compatible_cameras(a,b));
             if !exact && !suggested { continue; }
             if !selection.lens_model.is_empty() {
-                let matches = lens.map(|l| &l.id == lens_id).unwrap_or_else(|| exact && normalized(&profile.lens_model) == normalized(&selection.lens_model));
+                let matches = lens.map(|selected| {
+                    if &selected.id == lens_id { return true; }
+                    // A loaded digital mode may use another catalogue display name.
+                    // Keep its authored identity, while also matching that resolved
+                    // display identity for this camera, never for suggestions.
+                    exact && self.camera_database.lens(self.camera_database.camera_by_id(camera_id), &profile.lens_model)
+                        .is_some_and(|loaded| loaded.id == selected.id)
+                }).unwrap_or_else(|| exact && normalized(&profile.lens_model) == normalized(&selection.lens_model));
                 if !matches { continue; }
             }
             rows.push(serde_json::json!({

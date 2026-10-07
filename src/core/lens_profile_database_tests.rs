@@ -47,6 +47,206 @@ fn selection() -> Selection {
 }
 
 #[test]
+fn browse_includes_loadable_compatible_lens_modes() {
+    const BASE_ID: &str = "gopro-hero11black-wide-4000x3000@23976-no-eis";
+    const SUPER_ID: &str = "gopro-hero11black-super-1920x1080@23976-no-eis";
+    let fixture = Fixture::new();
+    fixture.bundle(json!({
+        "schema_version": 1,
+        "mounts": [],
+        "cameras": [{
+            "id": "gopro/hero11black", "brand": "GoPro", "model": "Hero11 Black",
+            "aliases": ["HERO11 Black"],
+            "profile_lenses": ["gyroflow/gopro/hero11black/wide", "gyroflow/gopro/hero11black/super"]
+        }],
+        "lenses": [
+            {"id": "gyroflow/gopro/hero11black/wide", "brand": "", "model": "Wide"},
+            {"id": "gyroflow/gopro/hero11black/super", "brand": "", "model": "Super"}
+        ]
+    }), vec![("GoPro/GoPro_HERO11 Black_Wide_4by3.json".into(), json!({
+        "camera_brand": "GoPro", "camera_model": "HERO11 Black", "lens_model": "Wide",
+        "calibrator_version": "1.2.0", "calibrated_by": "Eddy", "official": true,
+        "identifier": BASE_ID, "fps": 23.976,
+        "calib_dimension": {"w": 4000, "h": 3000},
+        "orig_dimension": {"w": 4000, "h": 3000},
+        "fisheye_params": {
+            "camera_matrix": [[1000, 0, 2000], [0, 1000, 1500], [0, 0, 1]],
+            "distortion_coeffs": [0, 0, 0, 0]
+        },
+        "compatible_settings": [{
+            "width": 1920, "height": 1080, "identifier": SUPER_ID, "fps": 23.976,
+            "digital_lens": "gopro_superview", "lens_model": "Super"
+        }]
+    }))]);
+    let db = fixture.load();
+    let selection = Selection {
+        camera_brand: "GoPro".into(), camera_model: "Hero11 Black".into(), lens_model: "Super".into()
+    };
+
+    let lenses = db.camera_database.options(&selection)["lenses"].as_array().unwrap().clone();
+    assert!(lenses.iter().any(|lens| lens["name"] == "Super" && lens["has_profiles"] == true));
+    let legacy_results = db.search("hero11", &std::collections::HashSet::new(), 0, 0);
+    assert_eq!(legacy_results.len(), 1);
+    assert_eq!(legacy_results[0].1, BASE_ID);
+    assert_eq!(legacy_results[0].0, db.get_by_id(BASE_ID).unwrap().get_display_name());
+
+    let manager = crate::StabilizationManager::default();
+    *manager.lens_profile_db.write() = db;
+    manager.load_lens_profile(SUPER_ID).unwrap();
+    let loaded = manager.lens.read();
+    // Database loading resolves the digital-lens adjustment before selection.
+    assert_eq!((loaded.calib_dimension.w, loaded.calib_dimension.h), (1920, 1080));
+    assert_eq!(loaded.digital_lens.as_deref(), Some("gopro_superview"));
+    assert_eq!(loaded.lens_model, "Superview");
+    assert!((loaded.fisheye_params.camera_matrix[0][0] - 360.0).abs() < 0.001);
+    drop(loaded);
+
+    let rows = manager.lens_profile_db.read().browse(&selection, false);
+    let row = rows.as_array().unwrap().iter().find(|row| row["id"] == SUPER_ID)
+        .expect("the selectable compatible lens mode should have a review row");
+    assert_eq!((row["width"].as_u64(), row["height"].as_u64()), (Some(1920), Some(1080)));
+
+    let mut replacement = LensProfileDatabase::default();
+    replacement.set_from_db(manager.lens_profile_db.read().clone());
+    replacement.prepare_list_for_ui();
+    assert_eq!(replacement.browse(&selection, false), rows);
+}
+
+#[test]
+fn browse_keeps_loaded_digital_mode_visible_with_distinct_catalogue_modes() {
+    const COMPATIBLE_ID: &str = "hero7-compatible-super";
+    const NATIVE_DIGITAL_ID: &str = "hero7-native-digital-super";
+    const PLAIN_SUPER_ID: &str = "hero7-plain-super";
+    const SUPERVIEW_ID: &str = "hero7-standalone-superview";
+    let fixture = Fixture::new();
+    let mut wide = profile("hero7-wide", "Wide author", 1000.0);
+    wide["camera_brand"] = json!("GoPro");
+    wide["camera_model"] = json!("HERO7 Black");
+    wide["lens_model"] = json!("Wide");
+    wide["calib_dimension"] = json!({"w": 4000, "h": 3000});
+    wide["orig_dimension"] = wide["calib_dimension"].clone();
+    wide["compatible_settings"] = json!([{
+        "width": 1920, "height": 1080, "identifier": COMPATIBLE_ID, "fps": 30,
+        "digital_lens": "gopro6_superview", "lens_model": "Super"
+    }]);
+    let mut plain_super = profile(PLAIN_SUPER_ID, "Super author", 900.0);
+    plain_super["camera_brand"] = json!("GoPro");
+    plain_super["camera_model"] = json!("HERO7 Black");
+    plain_super["lens_model"] = json!("Super");
+    let mut native_digital = plain_super.clone();
+    native_digital["identifier"] = json!(NATIVE_DIGITAL_ID);
+    native_digital["digital_lens"] = json!("gopro6_superview");
+    native_digital["calib_dimension"] = json!({"w": 1440, "h": 1080});
+    let mut superview = profile(SUPERVIEW_ID, "Superview author", 950.0);
+    superview["camera_brand"] = json!("GoPro");
+    superview["camera_model"] = json!("HERO7 Black");
+    superview["lens_model"] = json!("Superview");
+    // The actual bundled catalogue has separate owned Super and Superview IDs.
+    fixture.bundle(serde_json::to_value(crate::camera_database::CameraDatabase::bundled()).unwrap(), vec![
+        ("GoPro/hero7-wide.json".into(), wide),
+        ("GoPro/hero7-super.json".into(), plain_super),
+        ("GoPro/hero7-native-digital-super.json".into(), native_digital),
+        ("GoPro/hero7-superview.json".into(), superview),
+    ]);
+    let db = fixture.load();
+    let authored_selection = Selection {
+        camera_brand: "GoPro".into(), camera_model: "HERO7 Black".into(), lens_model: "Super".into()
+    };
+    let camera = db.camera_database.camera("GoPro", "HERO7 Black");
+    assert_ne!(db.camera_database.lens(camera, "Super").unwrap().id,
+               db.camera_database.lens(camera, "Superview").unwrap().id);
+    let authored_rows = db.browse(&authored_selection, false);
+    let authored_rows = authored_rows.as_array().unwrap();
+    assert!(authored_rows.iter().any(|row| row["id"] == COMPATIBLE_ID));
+    assert!(authored_rows.iter().any(|row| row["id"] == NATIVE_DIGITAL_ID));
+    assert!(authored_rows.iter().any(|row| row["id"] == PLAIN_SUPER_ID));
+    assert!(!authored_rows.iter().any(|row| row["id"] == SUPERVIEW_ID));
+
+    let manager = crate::StabilizationManager::default();
+    *manager.lens_profile_db.write() = db;
+    manager.load_lens_profile(COMPATIBLE_ID).unwrap();
+    let loaded = manager.lens.read();
+    assert_eq!(loaded.lens_model, "Superview");
+    assert_eq!((loaded.calib_dimension.w, loaded.calib_dimension.h), (1920, 1080));
+    // Match LensProfile.qml's selector prefill from the loaded profile metadata.
+    let loaded_selection = Selection {
+        camera_brand: loaded.camera_brand.clone(), camera_model: loaded.camera_model.clone(),
+        lens_model: loaded.lens_model.clone()
+    };
+    drop(loaded);
+    let loaded_rows = manager.lens_profile_db.read().browse(&loaded_selection, false);
+    let loaded_rows = loaded_rows.as_array().unwrap();
+    assert!(loaded_rows.iter().any(|row| row["id"] == COMPATIBLE_ID),
+        "the loaded digital mode must remain visible under the selector's normalized lens name");
+    assert!(loaded_rows.iter().any(|row| row["id"] == NATIVE_DIGITAL_ID),
+        "a standalone digital profile must retain the same normalized-selection behavior");
+    assert!(loaded_rows.iter().any(|row| row["id"] == SUPERVIEW_ID));
+    assert!(!loaded_rows.iter().any(|row| row["id"] == PLAIN_SUPER_ID),
+        "a distinct non-digital Super mode must not be conflated with Superview");
+}
+
+#[test]
+fn normalized_digital_mode_match_does_not_expand_camera_suggestions() {
+    let fixture = Fixture::new();
+    let mut digital = profile("other-camera-digital", "Author", 900.0);
+    digital["camera_model"] = json!("Camera 3");
+    digital["lens_model"] = json!("Super");
+    digital["digital_lens"] = json!("gopro_superview");
+    digital["calib_dimension"] = json!({"w": 1440, "h": 1080});
+    fixture.bundle(json!({
+        "schema_version": 1, "mounts": [],
+        "cameras": [
+            {"id": "future/camera2", "brand": "Future", "model": "Camera 2",
+             "mounts": ["fixture-mount"], "crop_factor": 1.0, "profile_lenses": ["super", "superview"]},
+            {"id": "future/camera3", "brand": "Future", "model": "Camera 3",
+             "mounts": ["fixture-mount"], "crop_factor": 1.0, "profile_lenses": ["super", "superview"]}
+        ],
+        "lenses": [
+            {"id": "super", "brand": "", "model": "Super"},
+            {"id": "superview", "brand": "", "model": "Superview"}
+        ]
+    }), vec![("Future/digital.json".into(), digital)]);
+    let db = fixture.load();
+    let camera2 = db.camera_database.camera("Future", "Camera 2").unwrap();
+    let camera3 = db.camera_database.camera("Future", "Camera 3").unwrap();
+    assert!(db.camera_database.compatible_cameras(camera2, camera3));
+    let own = Selection {
+        camera_brand: "Future".into(), camera_model: "Camera 3".into(), lens_model: "Superview".into()
+    };
+    assert_eq!(db.browse(&own, false).as_array().unwrap().len(), 1);
+    let suggested = Selection { camera_model: "Camera 2".into(), ..own };
+    assert!(db.browse(&suggested, true).as_array().unwrap().is_empty());
+    let authored = Selection { lens_model: "Super".into(), ..suggested };
+    let rows = db.browse(&authored, true);
+    assert_eq!(rows.as_array().unwrap().len(), 1);
+    assert_eq!(rows[0]["suggested"], true);
+}
+
+#[test]
+fn browse_copy_name_collision_does_not_change_legacy_search_names() {
+    let fixture = Fixture::new();
+    let mut original = profile("original", "Author", 900.0);
+    original["compatible_settings"] = json!([{
+        "width": 1920, "height": 1080, "identifier": "same-display-copy", "fps": 30
+    }]);
+    fixture.bundle(catalogue(), vec![("Future/profile.json".into(), original)]);
+    let db = fixture.load();
+
+    let expected_name = db.get_by_id("original").unwrap().get_display_name();
+    assert_eq!(db.get_by_id("same-display-copy").unwrap().get_display_name(), expected_name);
+    let legacy_results = db.search("future", &std::collections::HashSet::new(), 0, 0);
+    assert_eq!(legacy_results.len(), 1);
+    assert_eq!(legacy_results[0].0, expected_name);
+    assert_eq!(legacy_results[0].1, "original");
+
+    let rows = db.browse(&selection(), false);
+    let rows = rows.as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows.iter().find(|row| row["id"] == "original").unwrap()["name"].as_str(), Some(expected_name.as_str()));
+    assert_ne!(rows.iter().find(|row| row["id"] == "same-display-copy").unwrap()["name"].as_str(), Some(expected_name.as_str()));
+}
+
+#[test]
 fn updated_bundle_preserves_duplicate_identifier_submissions_and_clones() {
     let fixture = Fixture::new();
     fixture.bundle(catalogue(), vec![
